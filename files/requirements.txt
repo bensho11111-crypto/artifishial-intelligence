@@ -1,0 +1,32 @@
+# Core async + API
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+websockets>=12.0
+
+# Serial / NMEA
+pyserial>=3.5
+pyserial-asyncio>=0.6
+pynmea2>=1.19.0
+python-can>=4.3.0      # for NMEA 2000 over CAN bus
+
+# Numerics + Kalman filter
+numpy>=1.26.0
+scipy>=1.12.0
+filterpy>=1.4.5
+
+# Probabilistic mapping
+GPy>=1.13.0            # Gaussian Process regression
+
+# Mesh reconstruction (optional but recommended)
+scikit-image>=0.22.0
+
+# Storage
+sqlalchemy>=2.0.0
+geojson>=3.1.0
+
+# Config
+pyyaml>=6.0.1
+
+# Dev / testing
+pytest>=8.0.0
+pytest-asyncio>=0.23.0

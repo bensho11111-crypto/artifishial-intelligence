@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+env/
+
+# Claude Code
+.claude/
+
+# Data files (large binaries — regenerate with generate.py)
+data/synthetic/sample.sl2
+data/synthetic/nmea_0183.nmea
+data/synthetic/track.geojson
+
+# Config with secrets
+config/config.yaml
+
+# OS
+.DS_Store
+Thumbs.db

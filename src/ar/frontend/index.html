@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lowrance AR Depth Map</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0f1a; color: #e0e8f0; font-family: monospace; overflow: hidden; }
+  #hud {
+    position: fixed; top: 16px; left: 16px; z-index: 10;
+    background: rgba(10,20,40,0.7); border: 1px solid rgba(0,200,180,0.3);
+    padding: 12px 16px; border-radius: 8px; font-size: 13px; line-height: 1.8;
+  }
+  #hud span { color: #00c8b4; }
+  #canvas { position: fixed; inset: 0; }
+  #xr-btn {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: #00c8b4; color: #0a0f1a; border: none; border-radius: 8px;
+    padding: 12px 28px; font-size: 15px; font-weight: 700; cursor: pointer;
+    display: none;
+  }
+</style>
+</head>
+<body>
+<div id="hud">
+  Depth Map AR v1.5<br>
+  Points: <span id="h-pts">—</span><br>
+  Coverage: <span id="h-cov">—</span><br>
+  Mean depth: <span id="h-dep">—</span> m<br>
+  Updates: <span id="h-upd">—</span><br>
+  Speed: <span id="h-spd">—</span> kts<br>
+  Heading: <span id="h-hdg">—</span>°
+</div>
+
+<div id="compass" style="position:fixed; top:16px; left:50%; transform:translateX(-50%); z-index:10; width:80px; height:80px;">
+  <svg id="compass-svg" viewBox="-40 -40 80 80" width="80" height="80">
+    <!-- outer ring -->
+    <circle r="36" fill="none" stroke="rgba(0,200,180,0.35)" stroke-width="2"/>
+    <!-- cardinal ticks -->
+    <line x1="0" y1="-36" x2="0" y2="-29" stroke="rgba(0,200,180,0.6)" stroke-width="1.5"/>
+    <line x1="0" y1="36"  x2="0" y2="29"  stroke="rgba(0,200,180,0.6)" stroke-width="1.5"/>
+    <line x1="-36" y1="0" x2="-29" y2="0" stroke="rgba(0,200,180,0.6)" stroke-width="1.5"/>
+    <line x1="36"  y1="0" x2="29"  y2="0" stroke="rgba(0,200,180,0.6)" stroke-width="1.5"/>
+    <!-- N label -->
+    <text x="0" y="-20" text-anchor="middle" dominant-baseline="middle" fill="#00c8b4" font-size="10" font-family="monospace" font-weight="bold">N</text>
+    <!-- needle group — rotated by JS -->
+    <g id="compass-needle">
+      <!-- north (teal) -->
+      <polygon points="0,-22 4,0 0,6 -4,0" fill="#00c8b4"/>
+      <!-- south (dark) -->
+      <polygon points="0,22 4,0 0,6 -4,0" fill="rgba(0,200,180,0.25)" transform="rotate(180)"/>
+    </g>
+    <!-- centre dot -->
+    <circle r="3" fill="#00c8b4"/>
+    <!-- heading text below needle -->
+    <text id="compass-hdg-text" x="0" y="26" text-anchor="middle" dominant-baseline="middle" fill="rgba(0,200,180,0.75)" font-size="9" font-family="monospace">000°</text>
+  </svg>
+</div>
+
+<div id="replay-ctrl" style="display:none; position:fixed; bottom:24px; left:50%; transform:translateX(-50%); z-index:10; background:rgba(10,20,40,0.82); border:1px solid rgba(0,200,180,0.3); padding:10px 18px; border-radius:10px; font-family:monospace; font-size:13px; color:#e0e8f0; align-items:center; gap:12px; flex-wrap:nowrap;">
+  <button id="play-pause-btn" style="background:#00c8b4;border:none;border-radius:6px;padding:4px 12px;font-size:15px;cursor:pointer;color:#0a0f1a;">⏸</button>
+  <span id="replay-time" style="color:#00c8b4; white-space:nowrap;">0:00 / 0:00</span>
+  <input id="replay-slider" type="range" min="0" max="1000" step="1" value="0" style="width:220px;accent-color:#00c8b4;">
+  <label style="color:#aac; white-space:nowrap;">Speed:
+    <span id="replay-speed-val">1.0×</span>
+    <input id="replay-speed-input" type="range" min="-2" max="2" step="0.5" value="0" style="width:90px;accent-color:#00c8b4;vertical-align:middle;">
+  </label>
+</div>
+
+<div id="gt-panel" style="display:none; position:fixed; top:16px; right:16px; z-index:10; background:rgba(10,20,40,0.75); border:1px solid rgba(255,160,0,0.4); padding:12px 16px; border-radius:8px; font-family:monospace; font-size:12px; color:#e0e8f0; line-height:1.8;">
+  Ground Truth<br>
+  Fish schools: <span id="gt-count" style="color:#ffa040;">—</span><br>
+  Detected: <span id="gt-detected" style="color:#ffa040;">—</span><br>
+  Precision: <span id="gt-precision" style="color:#ffa040;">—</span><br>
+  Recall: <span id="gt-recall" style="color:#ffa040;">—</span><br>
+  <button id="fish-toggle-btn" onclick="window.toggleFishOverlay()" style="margin-top:6px; background:#ffa040; border:none; border-radius:5px; padding:4px 10px; font-family:monospace; font-size:11px; cursor:pointer; color:#0a0f1a;">Show Fish ▶</button>
+  <br>
+  <button id="floor-toggle-btn" onclick="window.toggleFloor()" style="margin-top:4px; background:#334466; border:none; border-radius:5px; padding:4px 10px; font-family:monospace; font-size:11px; cursor:pointer; color:#aaccff;">Hide Floor ◀</button>
+</div>
+
+<canvas id="canvas"></canvas>
+<button id="xr-btn">Enter AR</button>
+
+<script type="importmap">
+  { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.162/build/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+// Fish overlay — dynamically imported in SYNTHETIC_REPLAY mode
+let _fishOverlay = null;
+let _fishVisible = false;
+window.toggleFishOverlay = function() {
+  if (!_fishOverlay) return;
+  _fishVisible = !_fishVisible;
+  _fishOverlay.setVisible(_fishVisible);
+  document.getElementById('fish-toggle-btn').textContent =
+    _fishVisible ? 'Hide Fish ◀' : 'Show Fish ▶';
+};
+
+let _floorMesh = null;
+let _floorVisible = true;
+window.toggleFloor = function() {
+  _floorVisible = !_floorVisible;
+  if (_floorMesh) _floorMesh.visible = _floorVisible;
+  const btn = document.getElementById('floor-toggle-btn');
+  if (btn) btn.textContent = _floorVisible ? 'Hide Floor ◀' : 'Show Floor ▶';
+};
+
+// ── Three.js scene setup ──────────────────────────────────────────────────
+const canvas = document.getElementById('canvas');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 2000);
+camera.position.set(0, -30, 50);
+camera.lookAt(0, 0, 0);
+
+scene.add(new THREE.AmbientLight(0x334466, 1.5));
+const dLight = new THREE.DirectionalLight(0x99ccff, 2);
+dLight.position.set(50, -50, 100);
+scene.add(dLight);
+
+// ── 3D grid ───────────────────────────────────────────────────────────────
+const GRID_SIZE  = 200;
+const GRID_DIVS  = 40;
+const GRID_DEPTH = 30;
+const GRID_STEP  = 5;
+
+for (let d = 0; d <= GRID_DEPTH; d += GRID_STEP) {
+  const plane = new THREE.GridHelper(
+    GRID_SIZE, GRID_DIVS,
+    d === 0 ? 0x4a8ab8 : 0x2a5a82,
+    d === 0 ? 0x2a5070 : 0x153048
+  );
+  plane.rotation.x = Math.PI / 2;
+  plane.position.z = -d;
+  plane.material.transparent = true;
+  plane.material.opacity = d === 0 ? 0.70 : Math.max(0.12, 0.55 - d * 0.014);
+  scene.add(plane);
+}
+
+(function() {
+  const half = GRID_SIZE / 2, step = 20;
+  const verts = [];
+  for (let x = -half; x <= half + 0.1; x += step) {
+    for (let y = -half; y <= half + 0.1; y += step) {
+      verts.push(x, y, 0,  x, y, -GRID_DEPTH);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(verts), 3));
+  scene.add(new THREE.LineSegments(geo,
+    new THREE.LineBasicMaterial({ color: 0x3a7aaa, transparent: true, opacity: 0.40 })));
+})();
+
+// ── Point cloud geometry ──────────────────────────────────────────────────
+const MAX_PTS = 200_000;
+const geom = new THREE.BufferGeometry();
+const positions = new Float32Array(MAX_PTS * 3);
+const colors    = new Float32Array(MAX_PTS * 3);
+geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+geom.setAttribute('color',    new THREE.BufferAttribute(colors, 3));
+geom.setDrawRange(0, 0);
+
+const mat = new THREE.PointsMaterial({
+  size: 0.4, vertexColors: true, sizeAttenuation: true, transparent: true, opacity: 0.85
+});
+const points = new THREE.Points(geom, mat);
+scene.add(points);
+
+// ── Boat position marker ──────────────────────────────────────────────────
+const boatGeo = new THREE.ConeGeometry(1.2, 3.5, 4);
+boatGeo.rotateX(Math.PI / 2);   // point forward along +Y
+const boatMat = new THREE.MeshBasicMaterial({ color: 0x00ffcc });
+const boatMesh = new THREE.Mesh(boatGeo, boatMat);
+boatMesh.visible = false;
+scene.add(boatMesh);
+
+// Heading ring around the marker
+const ringGeo = new THREE.RingGeometry(2.0, 2.4, 32);
+const ringMat = new THREE.MeshBasicMaterial({ color: 0x00ffcc, side: THREE.DoubleSide, transparent: true, opacity: 0.45 });
+const boatRing = new THREE.Mesh(ringGeo, ringMat);
+scene.add(boatRing);
+
+// ── Colour mapping: depth + confidence → RGB ──────────────────────────────
+function depthColor(depth, maxDepth, confidence, std) {
+  // Hue: 240° (blue, shallow) → 0° (red, deep)
+  const t = Math.min(depth / maxDepth, 1.0);
+  const h = (1 - t) * 240 / 360;
+  const s = 0.8;
+  const l = 0.3 + confidence * 0.4;  // brighter = more confident
+  return hsl2rgb(h, s, l);
+}
+
+function hsl2rgb(h, s, l) {
+  let r, g, b;
+  if (s === 0) { r = g = b = l; }
+  else {
+    const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+    const p = 2 * l - q;
+    r = hue(p, q, h + 1/3);
+    g = hue(p, q, h);
+    b = hue(p, q, h - 1/3);
+  }
+  return [r, g, b];
+}
+function hue(p, q, t) {
+  if (t < 0) t += 1; if (t > 1) t -= 1;
+  if (t < 1/6) return p + (q - p) * 6 * t;
+  if (t < 1/2) return q;
+  if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+  return p;
+}
+
+function buildFloorMesh(floorGrid) {
+  const { rows, cols, depth_m, cell_size_m, origin_east_m, origin_north_m } = floorGrid;
+  const width  = (cols - 1) * cell_size_m;
+  const height = (rows - 1) * cell_size_m;
+
+  // Build BufferGeometry manually (PlaneGeometry is Y-up; we need Z-up)
+  const positions = new Float32Array(rows * cols * 3);
+  const colors    = new Float32Array(rows * cols * 3);
+  const indices   = [];
+
+  let maxD = 0, minD = Infinity;
+  for (let r = 0; r < rows; r++)
+    for (let c = 0; c < cols; c++) {
+      const d = depth_m[r][c];
+      if (d > maxD) maxD = d;
+      if (d < minD) minD = d;
+    }
+
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const idx = r * cols + c;
+      const east  = origin_east_m  + c * cell_size_m;
+      const north = origin_north_m + r * cell_size_m;
+      const depth = depth_m[r][c];
+      positions[idx * 3]     = east;
+      positions[idx * 3 + 1] = north;
+      positions[idx * 3 + 2] = -depth;   // depth is -Z in ENU scene
+
+      // Colour: shallow = sandy (0.9, 0.85, 0.6), deep = dark blue (0.05, 0.1, 0.35)
+      const t = (depth - minD) / (maxD - minD + 0.001);
+      colors[idx * 3]     = 0.9  - t * 0.85;
+      colors[idx * 3 + 1] = 0.85 - t * 0.75;
+      colors[idx * 3 + 2] = 0.6  + t * (0.35 - 0.6);  // actually gets darker blue
+    }
+  }
+
+  // Fix blue channel: shallow=sandy(0.6), deep=blue(0.45)
+  // Redo colour with a cleaner gradient
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const idx = r * cols + c;
+      const t   = (depth_m[r][c] - minD) / (maxD - minD + 0.001);
+      // shallow (t=0): rgb(210, 195, 130) sandy/tan
+      // deep    (t=1): rgb(10,  30, 80)  dark navy
+      colors[idx * 3]     = 0.82 - t * 0.78;
+      colors[idx * 3 + 1] = 0.76 - t * 0.64;
+      colors[idx * 3 + 2] = 0.51 + t * (0.31 - 0.51);
+    }
+  }
+
+  // Triangle indices
+  for (let r = 0; r < rows - 1; r++) {
+    for (let c = 0; c < cols - 1; c++) {
+      const a = r * cols + c;
+      const b = a + 1;
+      const d = (r + 1) * cols + c;
+      const e = d + 1;
+      indices.push(a, b, d,  b, e, d);   // two triangles per quad
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('color',    new THREE.BufferAttribute(colors,    3));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+
+  // Solid semi-transparent surface
+  const solidMat = new THREE.MeshLambertMaterial({
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.55,
+    side: THREE.DoubleSide,
+  });
+  const solid = new THREE.Mesh(geo, solidMat);
+
+  // Wireframe overlay
+  const wireGeo  = new THREE.WireframeGeometry(geo);
+  const wireMat  = new THREE.LineBasicMaterial({
+    color: 0x334466, transparent: true, opacity: 0.18,
+  });
+  const wire = new THREE.LineSegments(wireGeo, wireMat);
+
+  const group = new THREE.Group();
+  group.add(solid);
+  group.add(wire);
+  return group;
+}
+
+// ── WebSocket connection ──────────────────────────────────────────────────
+let maxDepth = 20;
+const ws = new WebSocket(`ws://${location.host}/ws/map`);
+
+ws.onmessage = (ev) => {
+  const msg = JSON.parse(ev.data);
+
+  if (msg.type === 'session_info' && msg.has_ground_truth) {
+    import('./synthetic_overlay.js').then(mod => {
+      _fishOverlay = mod;
+      mod.init(scene);
+    });
+
+    // Fetch floor grid and build mesh
+    fetch('/api/floor-grid')
+      .then(r => r.json())
+      .then(grid => {
+        if (grid.error) return;
+        _floorMesh = buildFloorMesh(grid);
+        _floorMesh.visible = _floorVisible;
+        scene.add(_floorMesh);
+      });
+    return;
+  }
+
+  if (msg.type === 'ground_truth_update' && _fishOverlay) {
+    _fishOverlay.updateSchools(msg.fish_schools);
+    return;
+  }
+
+  if (msg.type !== 'map_update') return;
+
+  const pc = msg.pointcloud;
+  if (!pc || !pc.x) return;
+
+  const n = Math.min(pc.x.length, MAX_PTS);
+  maxDepth = Math.max(maxDepth, ...pc.depth.slice(0, n));
+
+  for (let i = 0; i < n; i++) {
+    positions[i * 3]     = pc.x[i];
+    positions[i * 3 + 1] = pc.y[i];
+    positions[i * 3 + 2] = -pc.depth[i];   // depth is negative Z in ENU
+
+    const [r, g, b] = depthColor(pc.depth[i], maxDepth, pc.confidence[i], pc.std[i]);
+    colors[i * 3]     = r;
+    colors[i * 3 + 1] = g;
+    colors[i * 3 + 2] = b;
+  }
+  geom.attributes.position.needsUpdate = true;
+  geom.attributes.color.needsUpdate    = true;
+  geom.setDrawRange(0, n);
+
+  // HUD
+  document.getElementById('h-pts').textContent = n.toLocaleString();
+  document.getElementById('h-cov').textContent = (msg.stats?.coverage_pct ?? '—') + '%';
+  document.getElementById('h-dep').textContent = msg.stats?.mean_depth ?? '—';
+  document.getElementById('h-upd').textContent = msg.stats?.updates ?? '—';
+
+  // Boat marker
+  const b = msg.boat;
+  if (b && b.east !== undefined) {
+    boatMesh.position.set(b.east, b.north, 0.5);
+    boatMesh.rotation.z = -THREE.MathUtils.degToRad(b.heading);
+    boatMesh.visible = true;
+    boatRing.position.set(b.east, b.north, 0.2);
+  }
+
+  // Speed and heading
+  if (b) {
+    if (b.speed_kts !== undefined)
+      document.getElementById('h-spd').textContent = b.speed_kts.toFixed(1);
+    if (b.heading !== undefined) {
+      document.getElementById('h-hdg').textContent = b.heading.toFixed(0).padStart(3, '0');
+      // Compass: rotate needle so it points to the boat's heading
+      document.getElementById('compass-needle').setAttribute('transform',
+        `rotate(${b.heading})`);
+      document.getElementById('compass-hdg-text').textContent =
+        b.heading.toFixed(0).padStart(3, '0') + '°';
+    }
+  }
+};
+
+ws.onclose = () => console.warn('[WS] Disconnected — will retry');
+
+// ── Orbit controls — roll-free turntable (Z-up) ──────────────────────────
+// Left/right drag: azimuth around world Z. Up/down drag: elevation.
+// Elevation is clamped so the camera never rolls or flips.
+(function () {
+  const cam = camera;
+  let radius = cam.position.length();             // ~58 m initial
+  let az = Math.atan2(cam.position.y, cam.position.x);  // ≈ -π/2
+  let el = Math.asin(Math.max(-1, Math.min(1, cam.position.z / radius))); // ≈ 59°
+
+  function apply() {
+    cam.position.set(
+      radius * Math.cos(el) * Math.cos(az),
+      radius * Math.cos(el) * Math.sin(az),
+      radius * Math.sin(el)
+    );
+    cam.up.set(0, 0, 1);   // enforce Z-up so grid never tilts
+    cam.lookAt(0, 0, 0);
+  }
+
+  let drag = false, px = 0, py = 0;
+  canvas.addEventListener('mousedown',  e => { drag = true;  px = e.clientX; py = e.clientY; });
+  canvas.addEventListener('mouseup',    () => drag = false);
+  canvas.addEventListener('mouseleave', () => drag = false);
+  canvas.addEventListener('mousemove',  e => {
+    if (!drag) return;
+    const dx = e.clientX - px, dy = e.clientY - py;
+    px = e.clientX; py = e.clientY;
+    az -= dx * 0.003;
+    el  = Math.max(0.05, Math.min(Math.PI / 2 - 0.05, el - dy * 0.003));
+    apply();
+  });
+  canvas.addEventListener('wheel', e => {
+    radius = Math.max(5, Math.min(500, radius * (1 + e.deltaY * 0.001)));
+    apply();
+  });
+
+  apply();   // sync camera to initial angles
+})();
+
+// ── WebXR AR button ───────────────────────────────────────────────────────
+if ('xr' in navigator) {
+  navigator.xr.isSessionSupported('immersive-ar').then(supported => {
+    if (supported) {
+      document.getElementById('xr-btn').style.display = 'block';
+      document.getElementById('xr-btn').onclick = () => {
+        navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['local-floor'],
+          optionalFeatures: ['bounded-floor', 'plane-detection']
+        }).then(session => {
+          renderer.xr.setSession(session);
+        });
+      };
+    }
+  });
+}
+
+// ── Render loop ───────────────────────────────────────────────────────────
+renderer.setAnimationLoop(() => {
+  renderer.render(scene, camera);
+
+  // Send pose to server for view-dependent LOD
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: 'pose',
+      x: camera.position.x,
+      y: camera.position.y,
+      z: camera.position.z,
+    }));
+  }
+});
+
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+<script type="module" src="/static/replay.js"></script>
+</body>
+</html>

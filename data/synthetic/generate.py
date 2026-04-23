@@ -30,8 +30,148 @@ START_LON         = -117.5012
 START_HEADING_DEG = 52.0       # NE along the main channel
 SPEED_KTS         = 3.5        # typical slow-trolling speed
 WATER_TEMP_C      = 18.3       # spring surface temp
-BASE_DEPTH_M      = 6.0        # mean channel depth
 ORIGIN_UTC_S      = 8*3600 + 32*60   # session start 08:32:00 UTC
+
+
+# ── ENU helper (shared by FloorModel, Boat, SL2 generator) ───────────────
+
+def _lat_lon_to_enu_simple(lat, lon, origin_lat, origin_lon):
+    """Flat-earth approximation: returns (east_m, north_m)."""
+    R = 6_371_000.0
+    north = R * math.radians(lat - origin_lat)
+    east  = R * math.radians(lon - origin_lon) * math.cos(math.radians(origin_lat))
+    return east, north
+
+
+# ── 2D spatial floor model ────────────────────────────────────────────────
+
+class FloorModel:
+    """
+    Procedural 2D bathymetric height map using video-game terrain techniques:
+      - Fractal Brownian Motion (fBm) via sum of rotated sine waves (no extra deps)
+      - Domain warping (Inigo Quilez style) for organic, flowing shapes
+      - Hard ridge features using absolute-value noise (Ridged fBm)
+      - Shore falloff so edges are always shallow
+    """
+
+    GRID_SIZE_M  = 500
+    CELL_SIZE_M  = 2.0
+    BASE_DEPTH_M = 6.0
+    MAX_DEPTH_M  = 22.0
+    MIN_DEPTH_M  = 0.9
+
+    def __init__(self):
+        n = int(self.GRID_SIZE_M / self.CELL_SIZE_M)  # 250
+        self._n    = n
+        self._half = self.GRID_SIZE_M / 2.0
+
+        xs = np.linspace(-self._half, self._half, n, dtype=np.float32)
+        ys = np.linspace(-self._half, self._half, n, dtype=np.float32)
+        XX, YY = np.meshgrid(xs, ys, indexing='ij')
+
+        rng = np.random.RandomState(1337)
+
+        # ── fBm helpers ──────────────────────────────────────────────────────
+        def _fbm(Px, Py, r, octaves=7, lacunarity=2.0, persistence=0.45,
+                 base_freq=0.008):
+            """Sum of rotated sine waves — no scipy/noise needed."""
+            out  = np.zeros_like(Px)
+            amp  = 1.0
+            freq = base_freq
+            for _ in range(octaves):
+                angle  = r.uniform(0, 2 * np.pi)
+                cx, cy = np.cos(angle), np.sin(angle)
+                phase  = r.uniform(0, 2 * np.pi)
+                out   += amp * np.sin(freq * (cx * Px + cy * Py) + phase)
+                amp   *= persistence
+                freq  *= lacunarity
+            # normalise to [-1, 1]
+            norm = sum(persistence**i for i in range(octaves))
+            return (out / norm).astype(np.float32)
+
+        def _ridged_fbm(Px, Py, r, octaves=5, lacunarity=2.1, persistence=0.5,
+                        base_freq=0.012):
+            """Ridged noise: 1 - |fBm| per octave → sharp ridges."""
+            out  = np.zeros_like(Px)
+            amp  = 1.0
+            freq = base_freq
+            for _ in range(octaves):
+                angle  = r.uniform(0, 2 * np.pi)
+                cx, cy = np.cos(angle), np.sin(angle)
+                phase  = r.uniform(0, 2 * np.pi)
+                wave   = np.sin(freq * (cx * Px + cy * Py) + phase)
+                out   += amp * (1.0 - np.abs(wave))
+                amp   *= persistence
+                freq  *= lacunarity
+            norm = sum(persistence**i for i in range(octaves))
+            return (out / norm).astype(np.float32)
+
+        # ── Domain warping (two levels) ──────────────────────────────────────
+        # Level 1: warp the input coords with one fbm
+        r1, r2, r3, r4, r5 = [np.random.RandomState(s) for s in [10,20,30,40,50]]
+        warp1 = 70.0
+        q_x = _fbm(XX + 3.7,  YY + 17.4, r1, octaves=5, base_freq=0.006)
+        q_y = _fbm(XX + 14.1, YY + 5.9,  r2, octaves=5, base_freq=0.006)
+        WX1 = XX + warp1 * q_x
+        WY1 = YY + warp1 * q_y
+
+        # Level 2: warp the already-warped coords with another fbm
+        warp2 = 40.0
+        r_x = _fbm(WX1 + 8.3, WY1 + 2.1, r3, octaves=4, base_freq=0.010)
+        r_y = _fbm(WX1 + 1.6, WY1 + 9.7, r4, octaves=4, base_freq=0.010)
+        WX2 = WX1 + warp2 * r_x
+        WY2 = WY1 + warp2 * r_y
+
+        # ── Base terrain from double-warped fBm ──────────────────────────────
+        terrain = _fbm(WX2, WY2, r5, octaves=8, base_freq=0.007, persistence=0.48)
+        # terrain is in [-1, 1]; map to depth range
+        depth_range = self.MAX_DEPTH_M - self.MIN_DEPTH_M
+        grid = (self.MIN_DEPTH_M + (terrain * 0.5 + 0.5) * depth_range).astype(np.float32)
+
+        # ── Ridged features (underwater cliffs / rocky ridges) ───────────────
+        r6 = np.random.RandomState(60)
+        ridges = _ridged_fbm(WX1, WY1, r6, octaves=4, base_freq=0.018)
+        # ridges in [0,1]; punch holes downward and push ridges up
+        grid += (ridges - 0.5) * 4.0     # ±2 m ridge contribution
+
+        # ── Main navigable channel (domain-warped centreline) ────────────────
+        # Channel follows a curved path; cross-section is a smooth valley
+        channel_cx = 0.15 * XX + 28.0 * np.sin(XX / 100.0) + 12.0 * np.sin(XX / 40.0)
+        dist_ch = np.abs(YY - channel_cx)
+        channel_extra = 5.0 * np.exp(-0.5 * (dist_ch / 35.0) ** 2)
+        grid += channel_extra      # channel is deeper
+
+        # ── Shore falloff — edges always shallow ─────────────────────────────
+        edge_dist = np.minimum(
+            np.minimum(XX + self._half, self._half - XX),
+            np.minimum(YY + self._half, self._half - YY)
+        )
+        shore_width = 60.0
+        shore_factor = np.clip(edge_dist / shore_width, 0.0, 1.0)
+        # blend toward 1.5 m at edges
+        grid = grid * shore_factor + 1.5 * (1.0 - shore_factor)
+
+        # ── Final clamp ───────────────────────────────────────────────────────
+        self._grid = np.clip(grid, self.MIN_DEPTH_M, self.MAX_DEPTH_M)
+
+    def depth_at(self, east_m: float, north_m: float) -> float:
+        ix = int((east_m  + self._half) / self.CELL_SIZE_M)
+        iy = int((north_m + self._half) / self.CELL_SIZE_M)
+        ix = max(0, min(self._n - 1, ix))
+        iy = max(0, min(self._n - 1, iy))
+        return float(self._grid[ix, iy])
+
+    def sample_grid(self, step: int = 5) -> dict:
+        coarse = self._grid[::step, ::step].tolist()
+        n_out  = len(coarse)
+        return {
+            "rows":           n_out,
+            "cols":           len(coarse[0]) if coarse else 0,
+            "cell_size_m":    self.CELL_SIZE_M * step,
+            "origin_east_m":  -self._half,
+            "origin_north_m": -self._half,
+            "depth_m":        [[round(v, 2) for v in row] for row in coarse],
+        }
 
 
 # ── NMEA helpers ──────────────────────────────────────────────────────────
@@ -63,21 +203,19 @@ class Boat:
     Simple forward-Euler kinematic model.
 
     The heading follows a slow sinusoidal S-curve (like trolling back and
-    forth across a fishing hole), and the depth model combines three
-    sinusoidal components to mimic a realistic lake-floor profile:
-      - main channel gradient
-      - underwater ridge / shelf
-      - fine-scale sonar texture + quantisation noise
+    forth across a fishing hole).  Depth is queried from the FloorModel at
+    the boat's current ENU position so that revisiting the same location
+    always returns the same depth.
     """
 
-    def __init__(self):
+    def __init__(self, floor: FloorModel):
+        self.floor      = floor
         self.t          = 0.0
         self.lat        = START_LAT
         self.lon        = START_LON
         self.heading    = START_HEADING_DEG
         self.speed_kts  = SPEED_KTS
-        self.depth_m    = BASE_DEPTH_M
-        self._phase     = random.uniform(0, 2 * math.pi)
+        self.depth_m    = floor.depth_at(0.0, 0.0)
 
     def step(self, dt: float):
         self.t += dt
@@ -97,15 +235,11 @@ class Boat:
         self.lat += speed_ms * dt * math.cos(h) / 111_320.0
         self.lon += speed_ms * dt * math.sin(h) / (111_320.0 * math.cos(math.radians(self.lat)))
 
-        # Depth: three-component floor model + noise
-        self.depth_m = (
-            BASE_DEPTH_M
-            + 3.8 * math.sin(t * 0.052)            # main channel profile
-            + 1.3 * math.sin(t * 0.21 + 1.1)       # secondary ridge
-            + 0.40 * math.sin(t * 0.85 + self._phase)  # fine sonar texture
-            + 0.06 * random.gauss(0, 1)             # quantisation / noise floor
-        )
-        self.depth_m = max(0.6, self.depth_m)
+        # Query floor model for actual depth at current ENU position
+        east, north = _lat_lon_to_enu_simple(self.lat, self.lon, START_LAT, START_LON)
+        raw_depth = self.floor.depth_at(east, north)
+        # Add small per-ping noise (quantisation + acoustic noise)
+        self.depth_m = max(0.6, raw_depth + 0.04 * random.gauss(0, 1))
 
     def hdop(self) -> float:
         # Mild HDOP variation; occasional spike near canyon walls
@@ -165,7 +299,7 @@ def sdmtw(temp_c: float) -> str:
 
 # ── NMEA stream generation ────────────────────────────────────────────────
 
-def generate_nmea() -> tuple:
+def generate_nmea(floor: FloorModel) -> tuple:
     """
     Returns (lines, coords, props).
 
@@ -174,7 +308,7 @@ def generate_nmea() -> tuple:
       - GPS sentences (GGA + RMC + VTG) at GPS_HZ
       - Water temperature every ~10 s
     """
-    boat = Boat()
+    boat = Boat(floor)
     lines = []
     coords = []
     props  = []
@@ -286,14 +420,23 @@ class _FishSchoolSL2:
 
 _SL2_SPECIES_TS = {"bass": 0.85, "trout": 0.70, "carp": 0.60, "bream": 0.50}
 
+# Human-readable species names for ground_truth.json
+_SL2_SPECIES_NAMES = {
+    "bass":  "largemouth bass",
+    "trout": "rainbow trout",
+    "carp":  "common carp",
+    "bream": "bluegill bream",
+}
 
-def _build_sl2_fish_schools(boat_route_positions: list) -> list:
+
+def _build_sl2_fish_schools(boat_route_positions: list, floor: FloorModel) -> list:
     """
     Place 3–4 fish schools at fixed positions relative to the trolling route
     so that several arches are visible in the SL2 output.
 
     At least one school is placed directly on the trolling path to guarantee
-    a complete arch.
+    a complete arch.  School depths are derived from the floor model so fish
+    sit at a physically consistent fraction of the actual water column.
     """
     rng = random.Random(2024)   # deterministic for reproducibility
 
@@ -307,23 +450,29 @@ def _build_sl2_fish_schools(boat_route_positions: list) -> list:
 
     schools = []
 
-    # School 0: directly on trolling path → guaranteed complete arch
+    # School 0: exact route position at the 60-second mark → guaranteed complete arch
+    on_path_idx = min(60, len(boat_route_positions) - 1)
+    on_path_x, on_path_y = boat_route_positions[on_path_idx]
+    school0_depth = floor.depth_at(on_path_x, on_path_y) * 0.55  # mid-water
     schools.append(_FishSchoolSL2(
-        east_m   = cx,
-        north_m  = cy,
-        depth_m  = 3.5,
+        east_m   = on_path_x,
+        north_m  = on_path_y,
+        depth_m  = school0_depth,
         radius_m = 8.0,
         density  = 0.9,
         species  = "bass",
     ))
 
-    # School 1: slightly off-path (partial arch)
+    # School 1: exact route position at the 30-second mark → second guaranteed arch
+    early_idx = min(30, len(boat_route_positions) - 1)
+    early_x, early_y = boat_route_positions[early_idx]
+    school1_depth = floor.depth_at(early_x, early_y) * 0.60
     schools.append(_FishSchoolSL2(
-        east_m   = cx + 15.0,
-        north_m  = cy + 5.0,
-        depth_m  = 5.0,
+        east_m   = early_x,
+        north_m  = early_y,
+        depth_m  = school1_depth,
         radius_m = 6.0,
-        density  = 0.7,
+        density  = 0.8,
         species  = "trout",
     ))
 
@@ -352,14 +501,6 @@ def _build_sl2_fish_schools(boat_route_positions: list) -> list:
     ))
 
     return schools
-
-
-def _lat_lon_to_enu_simple(lat, lon, origin_lat, origin_lon):
-    """Flat-earth approximation: returns (east_m, north_m)."""
-    R = 6_371_000.0
-    north = R * math.radians(lat - origin_lat)
-    east  = R * math.radians(lon - origin_lon) * math.cos(math.radians(origin_lat))
-    return east, north
 
 
 def _sl2_header() -> bytes:
@@ -443,8 +584,8 @@ def _make_echo(depth_m: float, max_range_m: float, n: int,
 
             slant_range = math.sqrt(horiz_offset ** 2 + school.depth_m ** 2)
             ts_factor = _SL2_SPECIES_TS.get(school.species, 0.65)
-            echo_amp   = school.density * overlap * 0.4 * ts_factor
-            amp_counts = int(echo_amp * 180)
+            echo_amp   = school.density * overlap * 0.7 * ts_factor
+            amp_counts = int(echo_amp * 220)
 
             if amp_counts < 1:
                 continue
@@ -458,7 +599,8 @@ def _make_echo(depth_m: float, max_range_m: float, n: int,
 
     return bytes(echo)
 
-def generate_sl2(coords: list, props: list) -> bytes:
+def generate_sl2(coords: list, props: list, floor: FloorModel) -> tuple:
+    """Returns (sl2_bytes, fish_schools) so callers can inspect school positions."""
     # Build ENU positions for the boat route so we can compute fish offsets
     origin_lat = START_LAT
     origin_lon = START_LON
@@ -468,7 +610,7 @@ def generate_sl2(coords: list, props: list) -> bytes:
         east, north = _lat_lon_to_enu_simple(lat_c, lon_c, origin_lat, origin_lon)
         route_enu.append((east, north))
 
-    fish_schools = _build_sl2_fish_schools(route_enu)
+    fish_schools = _build_sl2_fish_schools(route_enu, floor)
     print(f"  SL2 fish schools: {len(fish_schools)} "
           f"({', '.join(s.species for s in fish_schools)})")
 
@@ -483,7 +625,7 @@ def generate_sl2(coords: list, props: list) -> bytes:
         data += block
         last = BLOCK_SIZE
     data += struct.pack("<H", 0)   # EOF sentinel
-    return data
+    return data, fish_schools
 
 
 # ── main ──────────────────────────────────────────────────────────────────
@@ -491,7 +633,9 @@ def generate_sl2(coords: list, props: list) -> bytes:
 def main():
     print("Generating synthetic Lowrance Elite 7 data …")
 
-    nmea_lines, coords, props = generate_nmea()
+    floor = FloorModel()
+
+    nmea_lines, coords, props = generate_nmea(floor)
 
     nmea_path = OUT_DIR / "nmea_0183.nmea"
     nmea_path.write_text("".join(nmea_lines), encoding="ascii")
@@ -501,10 +645,40 @@ def main():
     geo_path.write_text(json.dumps(generate_geojson(coords, props), indent=2), encoding="utf-8")
     print(f"  {geo_path.name}: {len(coords)} track points  ({geo_path.stat().st_size:,} bytes)")
 
-    sl2_data = generate_sl2(coords, props)
+    sl2_data, fish_schools = generate_sl2(coords, props, floor)
     sl2_path = OUT_DIR / "sample.sl2"
     sl2_path.write_bytes(sl2_data)
     print(f"  {sl2_path.name}: {len(props)} packets  ({sl2_path.stat().st_size:,} bytes)")
+
+    # ── ground_truth.json ─────────────────────────────────────────────────
+    floor_grid = floor.sample_grid(step=5)
+    gt = {
+        "generated_by": "generate.py",
+        "origin_lat":   START_LAT,
+        "origin_lon":   START_LON,
+        "fish_schools": [
+            {
+                "east_m":   round(s.east_m,   3),
+                "north_m":  round(s.north_m,  3),
+                "depth_m":  round(s.depth_m,  3),
+                "radius_m": s.radius_m,
+                "density":  s.density,
+                "species":  _SL2_SPECIES_NAMES.get(s.species, s.species),
+            }
+            for s in fish_schools
+        ],
+        "floor_grid":              floor_grid,
+        "lake_bottom_sample_20x20": None,   # kept for backward compat
+    }
+    gt_path = OUT_DIR / "ground_truth.json"
+    gt_path.write_text(json.dumps(gt, indent=2), encoding="utf-8")
+    print(f"  {gt_path.name}: {len(fish_schools)} fish schools  ({gt_path.stat().st_size:,} bytes)")
+
+    # ── sanity check ──────────────────────────────────────────────────────
+    rows = floor_grid["rows"]
+    cols = floor_grid["cols"]
+    centre_depth = floor_grid["depth_m"][25][25]
+    print(f"  floor_grid shape: {rows} × {cols}  |  depth[25][25] = {centre_depth} m")
 
     print("Done.")
 

@@ -257,16 +257,17 @@ class MappingWorker:
             obs = await self.obs_q.get()
             self.vmap.update(obs)
             self._latest_boat = {
-                "east":    round(float(obs.easting_m), 2),
-                "north":   round(float(obs.northing_m), 2),
-                "heading": round(float(obs.heading_deg), 1),
+                "east":      round(float(obs.easting_m), 2),
+                "north":     round(float(obs.northing_m), 2),
+                "heading":   round(float(obs.heading_deg), 1),
+                "speed_kts": round(float(obs.speed_ms) * 1.9438, 1),
             }
             now = time.time()
             if now - self._snapshot_ts > self.SNAPSHOT_INTERVAL:
                 self._snapshot = {
                     "ts": now,
                     "stats": self.vmap.stats(),
-                    "pointcloud": self.vmap.export_pointcloud(),
+                    "pointcloud": self.vmap.export_pointcloud(min_hits=1),
                     "boat": self._latest_boat,
                 }
                 self._snapshot_ts = now
